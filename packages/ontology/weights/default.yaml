@@ -1,0 +1,138 @@
+# The link-weight rules (ADR-120 D3 and Amendment 4; `01_DOMAIN_MODEL.md` §6.1).
+#
+# This file is the calibration of the edge-weight formula, not the ontology: it sits beside the
+# handling scheme, and the ontology and its packs do not hold it. It is an APPEND-ONLY list of
+# versions. A version already here is never edited, as an ADR is not; a recalibration is a new
+# version at the end, and `tests/adapters/graph_arcadedb/test_weight_rules.py` compares this file
+# with a frozen copy holding versions 1 to 3 to enforce it. Each stored weight records the version
+# and rule it was computed under (`WeightComponents.parameter_set`, "<version>/<rule>").
+#
+# Every version after 1 keeps `gamma` at 0 (ADR-123: a link's weight comes from the link alone):
+# the loader (`ontology/weights.py`) refuses a later version with any other gamma, and a test
+# proves it.
+#
+# `midpoint` and `scale` are derived, never hand-tuned: scale = alpha / 3 and
+# midpoint = beta + alpha / 3, so that at recency 1 and a mutual-information term of 0 a count term
+# of 0 normalises to the logistic of -1 and a count term of 1 (a type's heavy count) to the
+# logistic of 2. The loader refuses a version whose values are not those.
+#
+# A rule is `{unit, heavy}` (what one occurrence is, and the count that is heavy for the type) or
+# `{fixed}` (a structural type's weight, whatever its occurrences, recency or mutual information).
+# A type with no rule takes `default`.
+versions:
+  - version: 1
+    alpha: 0.5
+    beta: 0.2
+    gamma: 0.3
+    half_life_days: 90
+    midpoint: 0.3666666666666667
+    scale: 0.16666666666666666
+    default: {unit: one occurrence, heavy: 10}
+    rules:
+      SHARED_CELL_WITH: {unit: one week shared, heavy: 12}
+      VISITED: {unit: one visit, heavy: 8}
+      COMMUNICATED_WITH: {unit: one call, heavy: 40}
+      TRANSACTED: {unit: one transfer, heavy: 6}
+      MENTIONED_IN: {unit: one report, heavy: 3}
+      ROLE_IN: {unit: one incident, heavy: 3}
+      IN_CONFLICT_WITH: {unit: one episode, heavy: 2}
+      CO_DEFENDANT_OF: {fixed: 0.75}
+      FAMILY_OF: {fixed: 0.75}
+      MEMBER_OF: {fixed: 0.75}
+      HELD_AT: {fixed: 0.75}
+      DEPICTS: {fixed: 0.2}
+  - version: 2
+    # ADR-123: a link's weight comes from the link alone. Gamma is 0, so no other link's count
+    # reaches a weight; every other parameter and every rule is version 1's.
+    alpha: 0.5
+    beta: 0.2
+    gamma: 0
+    half_life_days: 90
+    midpoint: 0.3666666666666667
+    scale: 0.16666666666666666
+    default: {unit: one occurrence, heavy: 10}
+    rules:
+      SHARED_CELL_WITH: {unit: one week shared, heavy: 12}
+      VISITED: {unit: one visit, heavy: 8}
+      COMMUNICATED_WITH: {unit: one call, heavy: 40}
+      TRANSACTED: {unit: one transfer, heavy: 6}
+      MENTIONED_IN: {unit: one report, heavy: 3}
+      ROLE_IN: {unit: one incident, heavy: 3}
+      IN_CONFLICT_WITH: {unit: one episode, heavy: 2}
+      CO_DEFENDANT_OF: {fixed: 0.75}
+      FAMILY_OF: {fixed: 0.75}
+      MEMBER_OF: {fixed: 0.75}
+      HELD_AT: {fixed: 0.75}
+      DEPICTS: {fixed: 0.2}
+  - version: 3
+    # ADR-120 Amendment 9 decision 9: "uses", "paired with" and "occurred at" state a fact and are
+    # not evidence that grows with volume (their row count measures other links' evidence), so
+    # each has a fixed strength as custody and family links have. Every other value is version 2's,
+    # gamma 0 included.
+    alpha: 0.5
+    beta: 0.2
+    gamma: 0
+    half_life_days: 90
+    midpoint: 0.3666666666666667
+    scale: 0.16666666666666666
+    default: {unit: one occurrence, heavy: 10}
+    rules:
+      SHARED_CELL_WITH: {unit: one week shared, heavy: 12}
+      VISITED: {unit: one visit, heavy: 8}
+      COMMUNICATED_WITH: {unit: one call, heavy: 40}
+      TRANSACTED: {unit: one transfer, heavy: 6}
+      MENTIONED_IN: {unit: one report, heavy: 3}
+      ROLE_IN: {unit: one incident, heavy: 3}
+      IN_CONFLICT_WITH: {unit: one episode, heavy: 2}
+      CO_DEFENDANT_OF: {fixed: 0.75}
+      FAMILY_OF: {fixed: 0.75}
+      MEMBER_OF: {fixed: 0.75}
+      HELD_AT: {fixed: 0.75}
+      DEPICTS: {fixed: 0.2}
+      USES: {fixed: 0.75}
+      PAIRED_WITH: {fixed: 0.75}
+      OCCURRED_AT: {fixed: 0.75}
+
+# ADR-139: link-strength influencers the developers ship, and the rarity settings. Neither is a
+# weight version and neither changes a stored weight: a link's connection strength is its stored
+# weight (version 3 above) with the influencers that apply to it, worked out when it is read, under
+# the viewer's access (`ontology/influencers.py`; `01_DOMAIN_MODEL.md` §6.1a). An installation-wide
+# set approved by two people (maker–checker) replaces an influencer of the same id here, and a case
+# override replaces both; `enabled: false` in a later layer switches one off.
+#
+# The sizes are calibrated as `midpoint` and `scale` are, not hand-tuned: a boost moves an ordinary
+# link about as far as doubling its count would. An ordinary link is one at the default rule's
+# heavy count (10); doubling it to 20 adds alpha * (ln 21 - ln 11) / ln 11 = 0.1348 to the
+# pre-logistic score, and `test_influencers.py` holds the file to that derivation. They are to be
+# confirmed with the client, whose relative sizes are not yet known (ADR-139 context).
+influencers:
+  - id: direct
+    label: Direct link
+    # No trigger: these link types are direct connections whatever evidences them.
+    link_types: [COMMUNICATED_WITH, TRANSACTED, VISITED, SHARED_CELL_WITH]
+    change: add
+    size: 0.1348
+    note: to be confirmed with the client
+  - id: incident-source
+    label: Evidenced by an assault, disorder or find
+    # An Incident is at one end of a ROLE_IN link, and evidences the person-to-person links of the
+    # people it involves: a conflict, an association or a shared cell (NIEM pack v3).
+    trigger:
+      entity_type: Incident
+      property: category
+      values: [assault, disorder, find]
+    link_types: [ROLE_IN, IN_CONFLICT_WITH, ASSOCIATE_OF, SHARED_CELL_WITH]
+    change: add
+    size: 0.1348
+    note: to be confirmed with the client
+# Shared-attribute rarity (ADR-139 decision 4): any node linked to both entities of a pair is an
+# attribute they share, except a node of these types (an alert is a rule's finding, not a fact
+# about either of them). `measure` (ADR-139 Amendment 2): `share`, the client's own
+# (1 − the value's share of the pair links through values of its kind), or `idf` (Σ ln(N/df)).
+rarity:
+  exclude_types: [Alert]
+  measure: share
+# How connection strength is composed (ADR-139 Amendment 2): `standard` (the stored weight with
+# the influencers) or `client_parity` (rarity plus the influencers' adds, the client's own sum).
+# An installation version (maker–checker) or a case override may choose the other.
+composition: standard

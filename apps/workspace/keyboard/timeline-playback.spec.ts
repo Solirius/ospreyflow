@@ -1,0 +1,359 @@
+// A scripted, keyboard-only walkthrough of the timeline's own playback and cross-case-overlay
+// controls (`02_GLASS_FRONTEND.md` §3.4) — Phase 8 Stage 4f, proving reachability end to end for the
+// seventh keyboard-driven surface (`keyboard/timeline-playback-harness.tsx`'s own docstring has
+// the reasoning for a separate harness/spec pair). Like the other six, this file never calls
+// `page.mouse`/`.click()`.
+//
+// The speed `Select` and the cross-case-scope `Input`'s own Tab-reachability get no case here —
+// only an action with a real timed effect or a real network call does, the same exemption
+// `export-panel.spec.ts` already establishes for its own artefact-kind `Select`.
+import { expect, test, type Page } from "@playwright/test";
+
+import {
+  assertAllCovered,
+  registerCovered,
+  TIMELINE_PLAYBACK_ACTIONS,
+} from "./actionRegistry";
+
+// A strip with one dated event: a case with none has no brush and no playback at all (ADR-087), so
+// the playback and exact-date cases below need a case that has them.
+const ONE_EVENT_HISTOGRAM = {
+  bucketing: "fixed_interval",
+  buckets: [{ start: "2026-01-01T00:00:00Z", end: "2026-01-02T00:00:00Z", count: 1 }],
+  total: 1,
+};
+
+async function tabToElementNamed(
+  page: Page,
+  predicate: (active: { tag: string; text: string; ariaLabel: string }) => boolean,
+  maxTabs = 40,
+): Promise<void> {
+  for (let i = 0; i < maxTabs; i++) {
+    const active = await page.evaluate(() => ({
+      tag: document.activeElement?.tagName ?? "",
+      text: document.activeElement?.textContent ?? "",
+      ariaLabel: document.activeElement?.getAttribute("aria-label") ?? "",
+    }));
+    if (predicate(active)) return;
+    await page.keyboard.press("Tab");
+  }
+  throw new Error(`Tab never reached the target element within ${maxTabs} presses`);
+}
+
+test("pressing Play actually advances the playback clock forward, reachable by keyboard alone", async ({
+  page,
+}) => {
+  await page.route("**/*/v1/analytics/histogram", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(ONE_EVENT_HISTOGRAM),
+    });
+  });
+
+  await page.goto("/keyboard/timeline-playback-harness.html");
+
+  await tabToElementNamed(page, (active) => active.tag === "BUTTON" && active.text.includes("Play"));
+  await page.keyboard.press("Enter");
+
+  // The clock is a real `requestAnimationFrame` loop, not a state flip — poll for a genuine
+  // advance rather than asserting immediately after the keypress.
+  await page.waitForFunction(
+    () => (window.__TIMELINE_PLAYBACK_HARNESS__?.fraction ?? 0) > 0,
+    undefined,
+    { timeout: 5000 },
+  );
+  const fraction = await page.evaluate(() => window.__TIMELINE_PLAYBACK_HARNESS__?.fraction);
+  expect(fraction).toBeGreaterThan(0);
+
+  registerCovered("TIMELINE_PLAYBACK_ACTIONS", "toggle-playback-advances-the-clock");
+});
+
+/** Opens the timeline header's overflow menu by keyboard (ADR-097 step 3), where setting exact dates
+ * and overlaying another case now are. */
+async function openMore(page: Page): Promise<void> {
+  await tabToElementNamed(page, (active) => active.tag === "BUTTON" && active.ariaLabel === "More timeline options");
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("button", { name: "More timeline options" })).toHaveAttribute("aria-expanded", "true");
+}
+
+test("the exact-date boxes stay out of sight until Set exact dates is pressed, by keyboard alone", async ({
+  page,
+}) => {
+  await page.route("**/*/v1/analytics/histogram", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(ONE_EVENT_HISTOGRAM),
+    });
+  });
+  await page.goto("/keyboard/timeline-playback-harness.html");
+  await expect(page.getByLabel("Brush window start")).toHaveCount(0);
+  await expect(page.getByLabel("Brush window end")).toHaveCount(0);
+
+  await openMore(page);
+  await tabToElementNamed(page, (active) => active.tag === "BUTTON" && active.text.includes("Set exact dates"));
+  expect(await page.evaluate(() => document.activeElement?.getAttribute("aria-expanded"))).toBe("false");
+  await page.keyboard.press("Enter");
+  await expect(page.getByLabel("Brush window start")).toBeVisible();
+  await expect(page.getByLabel("Brush window end")).toBeVisible();
+  expect(await page.evaluate(() => document.activeElement?.getAttribute("aria-expanded"))).toBe("true");
+
+  await page.keyboard.press("Enter");
+  await expect(page.getByLabel("Brush window start")).toHaveCount(0);
+
+  registerCovered("TIMELINE_PLAYBACK_ACTIONS", "set-exact-dates-reveals-the-date-boxes");
+});
+
+test("the overlay box stays out of sight until Overlay another case is pressed, by keyboard alone", async ({
+  page,
+}) => {
+  await page.route("**/*/v1/analytics/histogram", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(ONE_EVENT_HISTOGRAM),
+    });
+  });
+  await page.goto("/keyboard/timeline-playback-harness.html");
+  await expect(page.getByLabel("Cross-case overlay investigation id")).toHaveCount(0);
+  await openMore(page);
+  await tabToElementNamed(page, (active) => active.tag === "BUTTON" && active.text.includes("Overlay another case"));
+  await page.keyboard.press("Enter");
+  await expect(page.getByLabel("Cross-case overlay investigation id")).toBeVisible();
+
+  registerCovered("TIMELINE_PLAYBACK_ACTIONS", "overlay-another-case-reveals-its-box");
+});
+
+test("entering a second investigation's id loads its own cross-case track, reachable by keyboard alone", async ({
+  page,
+}) => {
+  let crossCaseRequestSeen = false;
+  await page.route("**/*/v1/analytics/histogram", async (route) => {
+    const body = route.request().postDataJSON() as { filter?: { investigation_scope?: string } };
+    if (body.filter?.investigation_scope === "case-2") crossCaseRequestSeen = true;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(ONE_EVENT_HISTOGRAM),
+    });
+  });
+
+  await page.goto("/keyboard/timeline-playback-harness.html");
+
+  await openMore(page);
+  await tabToElementNamed(page, (active) => active.tag === "BUTTON" && active.text.includes("Overlay another case"));
+  await page.keyboard.press("Enter");
+  await tabToElementNamed(page, (active) => active.ariaLabel === "Cross-case overlay investigation id");
+  await page.keyboard.type("case-2");
+  await page.keyboard.press("Tab");
+
+  await expect
+    .poll(() => crossCaseRequestSeen, { timeout: 5000 })
+    .toBe(true);
+
+  registerCovered("TIMELINE_PLAYBACK_ACTIONS", "cross-case-overlay-loads-second-track");
+});
+
+test("a case with no dated events says so, and offers neither a brush nor playback (ADR-087)", async ({
+  page,
+}) => {
+  await page.route("**/*/v1/analytics/histogram", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ bucketing: "fixed_interval", buckets: [], total: 0 }),
+    });
+  });
+  await page.goto("/keyboard/timeline-playback-harness.html");
+  await expect(page.getByRole("status")).toHaveText(/No dated events in this case/);
+  await expect(page.getByRole("button", { name: /Play/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Set exact dates" })).toHaveCount(0);
+  // Inside the overflow menu too (ADR-097 step 3): opened, it offers no way to set a window.
+  if ((await page.getByRole("button", { name: "More timeline options" }).count()) > 0) {
+    await openMore(page);
+    await expect(page.getByRole("group", { name: "More timeline options" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Set exact dates" })).toHaveCount(0);
+  }
+  // Tab through the whole bar: nothing reachable can set a window or start a clock.
+  for (let i = 0; i < 8; i++) {
+    await page.keyboard.press("Tab");
+    const text = await page.evaluate(() => document.activeElement?.textContent ?? "");
+    expect(text).not.toMatch(/Play|exact dates/);
+  }
+  registerCovered("TIMELINE_PLAYBACK_ACTIONS", "no-dated-events-says-so-and-offers-no-brush-or-playback");
+});
+
+test("Density and Cyclical are one segmented switch in the header, changed by keyboard (ADR-097 step 3)", async ({ page }) => {
+  await page.route("**/*/v1/analytics/histogram", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(ONE_EVENT_HISTOGRAM) });
+  });
+  await page.goto("/keyboard/timeline-playback-harness.html");
+  const view = page.getByRole("group", { name: "Timeline view" });
+  await expect(view).toHaveClass(/segmented/);
+  await expect(view.getByRole("button", { name: "Density" })).toHaveAttribute("aria-pressed", "true");
+  await tabToElementNamed(page, (active) => active.tag === "BUTTON" && active.text === "Cyclical");
+  await page.keyboard.press("Enter");
+  await expect(view.getByRole("button", { name: "Cyclical" })).toHaveAttribute("aria-pressed", "true");
+  await expect(view.getByRole("button", { name: "Density" })).toHaveAttribute("aria-pressed", "false");
+  registerCovered("TIMELINE_PLAYBACK_ACTIONS", "timeline-mode-switch-by-keyboard");
+});
+
+test("a case whose events are all on one day is shown by the hour, and asks for hourly buckets", async ({ page }) => {
+  const intervals: (number | null | undefined)[] = [];
+  await page.route("**/*/v1/analytics/histogram", async (route) => {
+    intervals.push((route.request().postDataJSON() as { interval_seconds?: number | null }).interval_seconds);
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(ONE_EVENT_HISTOGRAM) });
+  });
+  await page.goto("/keyboard/timeline-playback-harness.html");
+  await expect(page.getByText("By the hour: every dated event is on one day")).toBeVisible();
+  expect(intervals).toContain(3600);
+});
+
+test("choosing the weekend by keyboard puts the cells in the map's request and dims the canvas (ADR-130 decision 2)", async ({
+  page,
+}) => {
+  const WEEKLY = {
+    bucketing: "weekday_hour",
+    buckets: [{ weekday: 5, hour: 9, count: 2 }],
+    total: 2,
+  };
+  const geoBodies: Array<{ filter: { weekday_hours?: Array<{ weekday: number; hour: number }> } }> = [];
+  const firstSeenBodies: Array<{ filter: { weekday_hours?: unknown } }> = [];
+  await page.route("**/*/v1/analytics/histogram", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(WEEKLY) });
+  });
+  await page.route("**/*/v1/analytics/geobins", async (route) => {
+    geoBodies.push(route.request().postDataJSON());
+    await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+  });
+  await page.route("**/*/v1/analytics/first-seen", async (route) => {
+    const body = route.request().postDataJSON() as { filter: { weekday_hours?: unknown } };
+    firstSeenBodies.push(body);
+    // Only node "a" has an event on a weekend; "b" and "c" have none.
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ nodes: { a: "2026-01-10T09:00:00Z" }, edges: {} }),
+    });
+  });
+  await page.goto("/keyboard/timeline-playback-harness.html?cells");
+
+  await tabToElementNamed(page, (active) => active.tag === "BUTTON" && active.text === "Cyclical");
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("button", { name: "Cyclical" })).toHaveAttribute("aria-pressed", "true");
+  await openMore(page);
+  await expect(page.getByRole("group", { name: "Choose cells (UTC)" })).toBeVisible();
+  await tabToElementNamed(page, (active) => active.tag === "BUTTON" && active.text === "Weekend");
+  await page.keyboard.press("Enter");
+
+  // The map's request carries the weekend: Saturday and Sunday, every hour.
+  await expect
+    .poll(() => geoBodies.some((b) => (b.filter.weekday_hours?.length ?? 0) === 48), { timeout: 5000 })
+    .toBe(true);
+  const weekend = geoBodies.find((b) => (b.filter.weekday_hours?.length ?? 0) === 48)!;
+  expect(new Set(weekend.filter.weekday_hours!.map((c) => c.weekday))).toEqual(new Set([5, 6]));
+  expect(new Set(weekend.filter.weekday_hours!.map((c) => c.hour)).size).toBe(24);
+  // The canvas dims what has no weekend event, by the same cells. Its request follows the map's, so
+  // it is waited for, not assumed (CI on 939ad86 checked before it was sent).
+  await expect
+    .poll(() => firstSeenBodies.some((b) => Array.isArray(b.filter.weekday_hours)), { timeout: 5000 })
+    .toBe(true);
+  await expect(page.getByTestId("dimmed-nodes")).toHaveText("b,c");
+
+  // Clear (in the same menu) takes the restriction off: nothing dimmed, and the map asks again with no cells.
+  await tabToElementNamed(page, (active) => active.tag === "BUTTON" && active.text === "Clear");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("dimmed-nodes")).toHaveText("");
+  await expect
+    .poll(() => geoBodies.at(-1)?.filter.weekday_hours === undefined, { timeout: 5000 })
+    .toBe(true);
+
+  registerCovered("TIMELINE_PLAYBACK_ACTIONS", "choose-the-weekend-by-keyboard");
+});
+
+/** Routes the weekly histogram, the map's bins and first-seen for the `?cells` harness, and records each
+ * body the map's bins were asked with. */
+async function routeWeekly(page: Page): Promise<Array<{ filter: { weekday_hours?: Array<{ weekday: number; hour: number }> } }>> {
+  const geoBodies: Array<{ filter: { weekday_hours?: Array<{ weekday: number; hour: number }> } }> = [];
+  await page.route("**/*/v1/analytics/histogram", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ bucketing: "weekday_hour", buckets: [{ weekday: 5, hour: 9, count: 2 }], total: 2 }),
+    });
+  });
+  await page.route("**/*/v1/analytics/geobins", async (route) => {
+    geoBodies.push(route.request().postDataJSON());
+    await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+  });
+  await page.route("**/*/v1/analytics/first-seen", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ nodes: {}, edges: {} }) });
+  });
+  return geoBodies;
+}
+
+async function openChooseCells(page: Page): Promise<void> {
+  await tabToElementNamed(page, (active) => active.tag === "BUTTON" && active.text === "Cyclical");
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("button", { name: "Cyclical" })).toHaveAttribute("aria-pressed", "true");
+  await openMore(page);
+  await expect(page.getByRole("group", { name: "Choose cells (UTC)" })).toBeVisible();
+}
+
+test("ticking a day checkbox by keyboard sends that day's cells in the map's request", async ({ page }) => {
+  const geoBodies = await routeWeekly(page);
+  await page.goto("/keyboard/timeline-playback-harness.html?cells");
+  await openChooseCells(page);
+
+  // Tab to the Wednesday box and tick it with Space.
+  await tabToElementNamed(page, (active) => active.tag === "INPUT" && active.ariaLabel === "Wed");
+  await page.keyboard.press("Space");
+  await expect(page.getByRole("checkbox", { name: "Wed" })).toBeChecked();
+
+  // Wednesday is 2 (0 = Monday); every hour of it is 24 cells.
+  await expect
+    .poll(() => geoBodies.some((b) => (b.filter.weekday_hours?.length ?? 0) === 24), { timeout: 5000 })
+    .toBe(true);
+  const sent = geoBodies.find((b) => (b.filter.weekday_hours?.length ?? 0) === 24)!;
+  expect(new Set(sent.filter.weekday_hours!.map((c) => c.weekday))).toEqual(new Set([2]));
+  expect(new Set(sent.filter.weekday_hours!.map((c) => c.hour)).size).toBe(24);
+
+  registerCovered("TIMELINE_PLAYBACK_ACTIONS", "tick-a-day-by-keyboard-sends-its-cells");
+});
+
+test("setting the From and To hours by keyboard sends those hours in the map's request", async ({ page }) => {
+  const geoBodies = await routeWeekly(page);
+  await page.goto("/keyboard/timeline-playback-harness.html?cells");
+  await openChooseCells(page);
+
+  // A day first, so there are cells to narrow: Monday (0).
+  await tabToElementNamed(page, (active) => active.tag === "INPUT" && active.ariaLabel === "Mon");
+  await page.keyboard.press("Space");
+  await tabToElementNamed(page, (active) => active.tag === "INPUT" && active.ariaLabel === "From hour");
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.type("9");
+  await tabToElementNamed(page, (active) => active.tag === "INPUT" && active.ariaLabel === "To hour");
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.type("11");
+
+  // Monday, hours 9 to 11: three cells.
+  await expect
+    .poll(
+      () =>
+        geoBodies.some((b) => {
+          const hours = (b.filter.weekday_hours ?? []).map((c) => c.hour).sort((x, y) => x - y);
+          return hours.length === 3 && hours[0] === 9 && hours[2] === 11;
+        }),
+      { timeout: 5000 },
+    )
+    .toBe(true);
+  const sent = geoBodies.find((b) => (b.filter.weekday_hours?.length ?? 0) === 3)!;
+  expect(sent.filter.weekday_hours!.every((c) => c.weekday === 0)).toBe(true);
+
+  registerCovered("TIMELINE_PLAYBACK_ACTIONS", "set-the-hours-by-keyboard-sends-them");
+});
+
+test("every registered timeline-playback action has its own proving test case above", () => {
+  assertAllCovered("TIMELINE_PLAYBACK_ACTIONS", TIMELINE_PLAYBACK_ACTIONS);
+});

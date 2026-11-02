@@ -1,0 +1,286 @@
+// @vitest-environment jsdom
+// ADR-113 stage 5: the trend builder offers only what `/trends/options` returns, previews and saves
+// what the form says, draws every period and series, says a refused trend in words with its three
+// choices, and puts a saved trend into a pack.
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { ALERT_OPTIONS, PACK, OPTIONS, figures, json, serve, type Call } from "./reportsTestKit";
+import { TrendsTab } from "./TrendsTab";
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+const SAVED = { id: "t1", investigation_id: "c1", created_by: "ana", created_at: "2026-10-01T09:00:00Z", updated_at: "2026-10-01T09:00:00Z", ...figures().definition };
+
+function routes(extra: (call: Call) => Response | null = () => null, saved: unknown[] = []) {
+  return (call: Call) =>
+    extra(call) ??
+    (call.method === "GET" && call.path === "trends/options" ? json(200, OPTIONS)
+      : call.method === "GET" && call.path === "trends" ? json(200, saved)
+      : call.method === "GET" && call.path === "packs" ? json(200, [PACK])
+      : call.method === "GET" && call.path === "trends/t1/figures" ? json(200, figures())
+      : null);  // prettier-ignore
+}
+
+function place(canAssemble = true) {
+  render(<TrendsTab api={{ apiBaseUrl: "http://x", bearerToken: "t", investigationId: "c1" }} canAssemble={canAssemble} />);
+}
+
+async function build() {
+  fireEvent.change(await screen.findByLabelText("Title"), { target: { value: "Payments by channel" } });
+  fireEvent.click(await screen.findByLabelText("Payments"));
+}
+
+// ADR-126 decision 6: the case's packs narrow what the builder offers, and a saved trend that now
+// uses a type outside them says so.
+const CASES = (domains: string[]) => json(200, [{ id: "c1", name: "C", level: "editor", created_at: "", created_by: "", domains }]);
+
+function routesIn(domains: string[], saved: unknown[] = []) {
+  return routes((c) => (c.path.startsWith("/v1/investigations") && !c.path.includes("/c1") ? CASES(domains) : null), saved);
+}
+
+describe("the trend builder and the case's domain models", () => {
+  it("says which domain models the case has, and where an Author changes them, when not all three", async () => {
+    serve(routesIn(["niem"]));
+    place();
+    const line = await screen.findByText(
+      "This case's domain models are Crime case analysis (NIEM); an Author can change them in the Cases drawer, beside 'Data this case reads'.",
+    );
+    expect(line).toBeTruthy();
+  });
+
+  it("names the core model for a case of no packs", async () => {
+    serve(routesIn([]));
+    place();
+    expect(
+      await screen.findByText(
+        "This case's domain models are Bespoke POLE (the core model); an Author can change them in the Cases drawer, beside 'Data this case reads'.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("says nothing of the kind when the case has all three", async () => {
+    serve(routesIn(["fibo", "niem", "stix"]));
+    place();
+    await screen.findByLabelText("Payments");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.queryByText(/This case's domain models are/)).toBeNull();
+  });
+
+  it("marks a saved trend that uses link types outside the case's domain models, and only that one", async () => {
+    const outside = { ...SAVED, id: "t2", title: "Owners", outside_case_domains: true };
+    const inside = { ...SAVED, outside_case_domains: false };
+    serve(routesIn(["niem"], [inside, outside]));
+    place();
+    const owners = (await screen.findByRole("button", { name: "Owners" })).closest("li") as HTMLElement;
+    const plain = screen.getByRole("button", { name: SAVED.title }).closest("li") as HTMLElement;
+    expect(within(owners).getByText("Uses link types outside this case's domain models")).toBeTruthy();
+    expect(within(plain).queryByText(/outside this case's domain models/)).toBeNull();
+  });
+});
+
+describe("the trend builder", () => {
+  it("says where a reading case's events are, naming only the cases the server named (ADR-099 Am. 9)", async () => {
+    const held = { has_events: false, held_by: [{ investigation_id: "l1", name: "Operation Ledger (synthetic demo)" }] };
+    serve(routes((c) => (c.method === "GET" && c.path === "events/holders" ? json(200, held) : null)));
+    place();
+    const note = await screen.findByRole("note", { name: "Where this case's events are" });
+    expect(note.textContent).toContain("The events of the datasets it reads are in Operation Ledger (synthetic demo).");
+  });
+
+  it("says nothing of the kind in a case that holds its own events", async () => {
+    const calls = serve(routes((c) => (c.path === "events/holders" ? json(200, { has_events: true, held_by: [] }) : null)));
+    place();
+    await screen.findByLabelText("Payments");
+    await waitFor(() => expect(calls.some((c) => c.path === "events/holders")).toBe(true));
+    expect(screen.queryByRole("note", { name: "Where this case's events are" })).toBeNull();
+  });
+
+  it("offers only the options' event types, and only fields every chosen type declares", async () => {
+    serve(routes());
+    place();
+    await screen.findByLabelText("Payments");
+    expect(screen.getAllByRole("checkbox").map((c) => c.parentElement?.textContent)).toEqual(["Payments", "Transfers", "Logins"]);
+    expect(screen.queryByRole("textbox", { name: /event type/i })).toBeNull();
+
+    fireEvent.click(screen.getByLabelText("Payments"));
+    fireEvent.click(screen.getByLabelText("Transfers"));
+    fireEvent.click(screen.getByLabelText("Sum"));
+    const sum = screen.getByLabelText("Property to add up") as HTMLSelectElement;
+    // "fee" is declared by Transfers only, so a sum over both cannot use it.
+    expect([...sum.options].map((o) => o.value)).toEqual(["", "amount"]);
+    const series = screen.getByLabelText("Series") as HTMLSelectElement;
+    expect([...series.options].map((o) => o.value)).toEqual(["", "event_type", "channel"]);
+
+    // Adding a type that shares no number field leaves nothing to sum and drops a chosen one.
+    fireEvent.change(sum, { target: { value: "amount" } });
+    fireEvent.click(screen.getByLabelText("Logins"));
+    expect([...(screen.getByLabelText("Property to add up") as HTMLSelectElement).options].map((o) => o.value)).toEqual([""]);
+    expect((screen.getByLabelText("Property to add up") as HTMLSelectElement).value).toBe("");
+  });
+
+  it("previews the definition the form says and draws one bar per period and every series", async () => {
+    const calls = serve(routes((c) => (c.method === "POST" && c.path === "trends/preview" ? json(200, figures()) : null)));
+    place();
+    await build();
+    fireEvent.click(screen.getByLabelText("Sum"));
+    fireEvent.change(screen.getByLabelText("Property to add up"), { target: { value: "amount" } });
+    fireEvent.change(screen.getByLabelText("Weeks back"), { target: { value: "26" } });
+    fireEvent.change(screen.getByLabelText("Series"), { target: { value: "channel" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add filter" }));
+    fireEvent.change(screen.getByLabelText("Filter property"), { target: { value: "channel" } });
+    fireEvent.change(screen.getByLabelText("Filter value"), { target: { value: "card" } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+
+    const chart = await screen.findByRole("img", { name: /Payments by channel/ });
+    expect(calls.find((c) => c.path === "trends/preview")?.body).toEqual({
+      title: "Payments by channel", event_types: ["payment"], measure: "sum", measure_field: "amount",
+      interval: "week", weeks: 26, group_by: "channel", filters: [{ field: "channel", value: "card" }],
+    });  // prettier-ignore
+    expect(chart.querySelectorAll("[data-period]")).toHaveLength(13);
+    const legend = screen.getByRole("list", { name: "Series legend" });
+    expect(within(legend).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["card", "wire"]);
+    expect(screen.getByText("Marked OFFICIAL")).toBeTruthy();
+    expect(screen.getByText("Sum of amount: 12,400 over 31 events in 12 weeks; 2 events had no amount and are not in the sum")).toBeTruthy();
+  });
+
+  it("says a trend past its limit in words, with its three choices", async () => {
+    serve(routes((c) => (c.path === "trends/preview" ? json(409, { error: "limit_exceeded", cap_kind: "periods", cap: 60, would_be: 104, options: ["shorter_period", "monthly_interval", "fewer_series"] }) : null)));
+    place();
+    await build();
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      "This trend would have 104 periods, past its limit of 60. Choose a shorter period, a monthly interval, or fewer series.",
+    );
+  });
+
+  it("says a refused definition in the server's words", async () => {
+    serve(routes((c) => (c.path === "trends/preview" ? json(422, { error: "trend_refused", detail: "payment declares no field called fee" }) : null)));
+    place();
+    await build();
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    expect((await screen.findByRole("alert")).textContent).toBe("payment declares no field called fee");
+  });
+
+  it("saves the definition and refreshes the saved list, choosing the new trend", async () => {
+    let saved: unknown[] = [];
+    const calls = serve(
+      routes((c) => {
+        if (c.method === "POST" && c.path === "trends") {
+          saved = [SAVED];
+          return json(201, SAVED);
+        }
+        return c.method === "GET" && c.path === "trends" ? json(200, saved) : null;
+      }),
+    );
+    place();
+    await build();
+    expect(screen.queryByRole("button", { name: "Payments by channel" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save trend" }));
+    expect(await screen.findByRole("button", { name: "Payments by channel" })).toBeTruthy();
+    expect(calls.find((c) => c.method === "POST" && c.path === "trends")?.body).toMatchObject({ title: "Payments by channel", event_types: ["payment"], measure: "count", measure_field: null, group_by: null, filters: [] });
+    expect(calls.filter((c) => c.method === "GET" && c.path === "trends")).toHaveLength(2);
+    expect(await screen.findByRole("img", { name: /Payments by channel/ })).toBeTruthy();
+  });
+
+  it("will not preview or save without a title, an event type and a sum's property", async () => {
+    const calls = serve(routes());
+    place();
+    await screen.findByLabelText("Payments");
+    expect((screen.getByRole("button", { name: "Preview" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText("Give the trend a title.")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "x" } });
+    fireEvent.click(screen.getByLabelText("Payments"));
+    fireEvent.click(screen.getByLabelText("Sum"));
+    expect(screen.getByText("Choose the property to add up.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save trend" }));
+    expect(calls.some((c) => c.method === "POST")).toBe(false);
+  });
+
+  it("offers at most five filters", async () => {
+    serve(routes());
+    place();
+    await build();
+    for (let i = 0; i < 5; i++) fireEvent.click(screen.getByRole("button", { name: "Add filter" }));
+    expect(screen.getAllByLabelText("Filter property")).toHaveLength(5);
+    expect((screen.getByRole("button", { name: "Add filter" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+describe("a saved trend", () => {
+  it("is drawn when chosen and added to a pack", async () => {
+    const calls = serve(routes((c) => (c.method === "POST" && c.path === "packs/p1/items" ? json(201, { id: "i9" }) : null), [SAVED]));
+    place();
+    fireEvent.click(await screen.findByRole("button", { name: "Payments by channel" }));
+    expect(await screen.findByRole("img", { name: /Payments by channel/ })).toBeTruthy();
+    await waitFor(() => expect((screen.getByLabelText("Pack") as HTMLSelectElement).value).toBe("p1"));
+    fireEvent.click(screen.getByRole("button", { name: "Add to pack" }));
+    expect(await screen.findByText("Added to Quarter pack")).toBeTruthy();
+    expect(calls.find((c) => c.path === "packs/p1/items")?.body).toEqual({ kind: "trend", trend_id: "t1" });
+  });
+
+  it("is not offered to a pack to someone who may not assemble one", async () => {
+    const calls = serve(routes(() => null, [SAVED]));
+    place(false);
+    fireEvent.click(await screen.findByRole("button", { name: "Payments by channel" }));
+    await screen.findByRole("img", { name: /Payments by channel/ });
+    expect(screen.queryByRole("button", { name: "Add to pack" })).toBeNull();
+    expect(screen.queryByLabelText("Pack")).toBeNull();
+    // Nor does it ask for the case's packs: a route it would only be refused.
+    expect(calls.some((c) => c.path === "packs")).toBe(false);
+  });
+
+  it("is deleted", async () => {
+    const calls = serve(routes((c) => (c.method === "DELETE" ? json(204, null) : null), [SAVED]));
+    place();
+    fireEvent.click(await screen.findByRole("button", { name: "Payments by channel" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(calls.some((c) => c.method === "DELETE" && c.path === "trends/t1")).toBe(true));
+  });
+});
+
+// ADR-134 decision 3: the builder's second source. Alerts are counted, never summed; they are split
+// and filtered by the closed alert fields alone, each value shown by its label.
+describe("an alert trend", () => {
+  function alertRoutes(extra: (call: Call) => Response | null = () => null) {
+    return routes((c) => extra(c) ?? (c.method === "GET" && c.path === "trends/options" ? json(200, ALERT_OPTIONS) : null));
+  }
+
+  it("counts alerts: no event types, no sum, the alert fields to split and filter by", async () => {
+    const calls = serve(alertRoutes((c) => (c.method === "POST" && c.path === "trends/preview" ? json(200, figures({ source: "alerts", event_types: [], measure: "count", measure_field: null, group_by: "rule" })) : null)));
+    place();
+    fireEvent.change(await screen.findByLabelText("Title"), { target: { value: "Alerts by rule" } });
+    // An analyst who began an event trend and changed their mind: nothing of it is sent.
+    fireEvent.click(await screen.findByLabelText("Payments"));
+    fireEvent.click(screen.getByRole("radio", { name: "Sum" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Alerts" }));
+    expect(screen.queryByLabelText("Payments")).toBeNull();
+    expect(screen.queryByRole("radio", { name: "Sum" })).toBeNull();
+    const series = screen.getByLabelText("Series");
+    expect([...series.querySelectorAll("option")].map((o) => o.textContent)).toEqual(["None", "By rule", "By typology", "By severity", "By outcome"]);
+    fireEvent.change(series, { target: { value: "rule" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add filter" }));
+    fireEvent.change(screen.getByLabelText("Filter property"), { target: { value: "severity" } });
+    const value = screen.getByLabelText("Filter value");
+    expect(within(value).getByRole("option", { name: "High" })).toBeTruthy();
+    fireEvent.change(value, { target: { value: "high" } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await waitFor(() => expect(calls.find((c) => c.path === "trends/preview")?.body).toEqual({
+      title: "Alerts by rule", source: "alerts", event_types: [], measure: "count", measure_field: null, interval: "week",
+      weeks: 12, group_by: "rule", filters: [{ field: "severity", value: "high" }],
+    }));
+  });
+
+  it("can be previewed with no event type chosen, which an event trend cannot", async () => {
+    serve(alertRoutes());
+    place();
+    fireEvent.change(await screen.findByLabelText("Title"), { target: { value: "Alerts" } });
+    expect(screen.getByText("Choose at least one event type.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("radio", { name: "Alerts" }));
+    expect(screen.queryByText("Choose at least one event type.")).toBeNull();
+    expect((screen.getByRole("button", { name: "Preview" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+});

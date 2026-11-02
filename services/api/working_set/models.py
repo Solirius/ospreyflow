@@ -1,0 +1,481 @@
+"""Wire and internal shapes for the Working-Set Service —
+`spec/03_CONDUIT_MIDDLEWARE.md` §3.2 (the delta protocol) and §4 (caps,
+storage, projection), `spec/00_ARCHITECTURE.md` §4.
+
+The delta ops below (`add`/`remove`/`reproject`, and `replace_edge`) are
+`03_CONDUIT_MIDDLEWARE.md` §3.2's own illustrative examples, given real
+types. §3.2's `notice` left the protocol with ADR-124 (a count of what a reader may not read
+points at it) and its `update` with U4 (nothing produced one, and it named node ids).
+`DeltaSnapshot` is not one of those: §3.2's prose requires it
+("a client that misses a sequence reconnects and requests a full snapshot
+rather than attempting to patch") without giving its wire shape, so this
+follows the same pattern `GraphPort` set when it grew past its own
+illustrative snippet (`00_ARCHITECTURE.md` §2.1) — a real shape belongs in
+code, not only in a docstring.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, Field, TypeAdapter, model_validator
+
+from ontology.handling import withhold_sources
+from schemas.domain import ClusterId, Edge, EdgeId, Handling, Node, NodeId, Principal
+
+#: `00_ARCHITECTURE.md` §4 / `03_CONDUIT_MIDDLEWARE.md` §4 — "50,000 nodes
+#: and 250,000 edges" by policy (ADR-007). Not a config value: raising the
+#: figure is a revisit of the ADR once measurement supports it, not a
+#: deployment-time setting.
+MAX_NODES = 50_000
+MAX_EDGES = 250_000
+
+#: ADR-098 Amendment 4 (the owner: "limit the maximum depth to 6"): the furthest *Show links among
+#: these* looks for routes between the selected nodes, and how many may be selected to look at all
+#: past one degree (28 pairs, each searched at most six times).
+LINKS_AMONG_MAX_DEGREE = 6
+LINKS_AMONG_ROUTE_NODES = 8
+
+LimitOption = Literal["branch", "filter", "promote_to_batch"]
+_ALL_LIMIT_OPTIONS: tuple[LimitOption, LimitOption, LimitOption] = (
+    "branch",
+    "filter",
+    "promote_to_batch",
+)
+
+
+class LimitExceeded(BaseModel):
+    """`03_CONDUIT_MIDDLEWARE.md` §4: "On breach the service does not
+    truncate; it returns a `limit_exceeded` response naming the three
+    options the Glass offers the analyst... Encode this as a typed error,
+    not a generic 400". A slice anywhere near the working set is the
+    defect this type exists to make structurally impossible to return by
+    accident — there is no code path that produces a `Subgraph` silently
+    capped at the boundary; there is only this, or success."""
+
+    error: Literal["limit_exceeded"] = "limit_exceeded"
+    #: "pairs": a shared-attribute rarity read (ADR-139) with more entity pairs to score than its
+    #: cap; scored in part, it would rank pairs against a partial picture.
+    cap_kind: Literal["nodes", "edges", "pairs"]
+    cap: int
+    would_be: int
+    options: tuple[LimitOption, LimitOption, LimitOption] = _ALL_LIMIT_OPTIONS
+
+
+class LimitExceededError(Exception):
+    """Raised by `WorkingSetService.expand`/`seed` on a cap breach. The API
+    surface (next phase) catches this and renders `detail` as the typed
+    body — never a generic 400 (`03_CONDUIT_MIDDLEWARE.md` §4)."""
+
+    def __init__(self, detail: LimitExceeded) -> None:
+        super().__init__(f"{detail.cap_kind} cap of {detail.cap} would be breached")
+        self.detail = detail
+
+
+class BranchFilter(BaseModel):
+    """What a reader chooses to narrow their own view to, to branch it when it is past the cap
+    (ADR-124 decision 2, "the filter"): entity types, a date window, or both. Entity types select
+    nodes. The window selects links whose `interval` overlaps it (a link with no interval is kept).
+    A link is kept only when both its ends are kept. Applied to the reader's own projected view
+    and to nothing else, so a type only hidden material holds selects what a type that does not
+    exist selects: nothing."""
+
+    entity_types: list[str] | None = None
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+
+    @model_validator(mode="after")
+    def _a_choice_is_made(self) -> BranchFilter:
+        if self.entity_types is None and self.valid_from is None and self.valid_to is None:
+            raise ValueError("choose entity types, a date window, or both")
+        if self.valid_from and self.valid_to and self.valid_from > self.valid_to:
+            raise ValueError("the window ends before it starts")
+        return self
+
+    def keeps_node(self, node: Node) -> bool:
+        return self.entity_types is None or node.type in self.entity_types
+
+    def keeps_link_in_time(self, edge: Edge) -> bool:
+        """Whether the link's interval overlaps the window; a link with none is kept, as is any
+        link when no window was chosen."""
+        if edge.interval is None or (self.valid_from is None and self.valid_to is None):
+            return True
+        starts_in_time = self.valid_to is None or edge.interval.valid_from <= self.valid_to
+        ends_in_time = (
+            self.valid_from is None
+            or edge.interval.valid_to is None
+            or edge.interval.valid_to >= self.valid_from
+        )
+        return starts_in_time and ends_in_time
+
+
+class NothingToBranchError(Exception):
+    """A branch of a chosen set of nodes (ADR-084) found nothing to copy: every id asked for is
+    absent, hidden from the branching principal, or the choice was empty. One error for all three,
+    on purpose, so the answer cannot be used to tell a hidden node from one that does not exist
+    (`CLAUDE.md` rules 3 and 4). Raised before any case is created, so none is left behind empty."""
+
+
+class DeltaAdd(BaseModel):
+    seq: int
+    op: Literal["add"] = "add"
+    nodes: list[Node] = Field(default_factory=list)
+    edges: list[Edge] = Field(default_factory=list)
+
+
+def add_for_reader(delta: DeltaAdd, reader: Principal) -> DeltaAdd:
+    """`delta` as `reader` may be sent it: each element's sources withheld where the reader's case
+    does not read every dataset of it (ADR-130 Amendment 2). For a writer's own response; the
+    delta it publishes is projected per recipient by `WorkingSetService.project_delta`."""
+    return delta.model_copy(
+        update={
+            "nodes": [withhold_sources(n, reader) for n in delta.nodes],
+            "edges": [withhold_sources(e, reader) for e in delta.edges],
+        }
+    )
+
+
+class DeltaViewOverCap(BaseModel):
+    """Sent in place of a snapshot or a delta when the reader's own projected view of the case is
+    past a cap (ADR-124 decision 2, "a view pushed past the cap"). A less-cleared colleague's cap
+    counts only their own view, so their ordinary work can push a more-cleared reader's view past
+    the cap; the reader is told, with their own figures (`would_be`, the same typed shape as
+    `limit_exceeded`: which cap, its size, and the reader's figure, with the three options) and
+    nothing about anyone else's view. Nothing further is sent on that socket until a resync with
+    no last sequence runs the full-snapshot path again. `seq` is the sequence number of what it
+    replaces, so a client's sequence check is unmoved.
+
+    Send-only: never stored and never published (`publish_delta` refuses it), so it is not in
+    `WorkingSetDelta`."""
+
+    seq: int
+    op: Literal["view_over_cap"] = "view_over_cap"
+    would_be: LimitExceeded
+
+
+class RemovedElement(BaseModel):
+    """What the service needs to say, later and for any reader, whether a removed element is one
+    that reader may read (ADR-124 decision 4): its handling and datasets, and for a link its two
+    ends. It is stored with the delta and published with it, and is never sent: `project_delta`
+    reads it and drops it."""
+
+    handling: Handling
+    datasets: list[str] = Field(default_factory=list)
+    source: NodeId | None = None
+    target: NodeId | None = None
+
+
+class RemovedRecord(BaseModel):
+    """The record of a `DeltaRemove`: each removed node's and link's `RemovedElement`, by id."""
+
+    nodes: dict[NodeId, RemovedElement] = Field(default_factory=dict)
+    edges: dict[EdgeId, RemovedElement] = Field(default_factory=dict)
+
+
+class DeltaRemoveSent(BaseModel):
+    """What a removal looks like on a socket, in a route's response and in a reconnect's catch-up:
+    the ids the reader may read, and nothing else (ADR-124 decision 4). It never holds the record
+    (`DeltaRemove.removed`), which is the stored form's alone. `edge_ids` takes a link off the
+    canvas without taking its ends."""
+
+    seq: int
+    op: Literal["remove"] = "remove"
+    node_ids: list[NodeId] = Field(default_factory=list)
+    edge_ids: list[EdgeId] = Field(default_factory=list)
+
+
+class DeltaRemove(BaseModel):
+    """The stored and published removal: the ids, and the record of what each removed id was
+    (`removed`), which is what lets every reader's projection be decided from the delta alone.
+    A stored removal written before the record existed has `removed = None`, and a reconnect over
+    one is answered with a full snapshot: passing it on would send ids the reader may not read, and
+    dropping its ids would leave the reader's canvas unlike a snapshot's (`deltas_after`).
+
+    **Not a `DeltaRemoveSent`, and not a subclass of it**, so that a function typed to send one
+    cannot be handed the other: the checker keeps the record off the wire. `to_sent` is the one
+    conversion, all of the ids and none of the record, for the analyst who made the change and
+    needs no projection of their own act."""
+
+    seq: int
+    op: Literal["remove"] = "remove"
+    node_ids: list[NodeId] = Field(default_factory=list)
+    edge_ids: list[EdgeId] = Field(default_factory=list)
+    removed: RemovedRecord | None = None
+
+    def to_sent(self) -> DeltaRemoveSent:
+        return DeltaRemoveSent(seq=self.seq, node_ids=self.node_ids, edge_ids=self.edge_ids)
+
+
+class DeltaReplaceEdgeSent(BaseModel):
+    """One link stands in for another (ADR-080): an analyst changed a link's type or details, which
+    supersedes it. The old link leaves the working set and `edge` arrives in its place, in one step,
+    so a client never shows both and a reconnecting client never keeps the old one. This is the
+    shape that is sent; the stored form is `DeltaReplaceEdge`."""
+
+    seq: int
+    op: Literal["replace_edge"] = "replace_edge"
+    old_edge_id: EdgeId
+    edge: Edge
+
+
+class DeltaReplaceEdge(BaseModel):
+    """The stored and published replacement, with the old link's record (`removed`: its handling,
+    datasets and ends) so that a reader's projection can be decided from it: a reader may read the
+    replace, only the new link, only the removal of the old one, or nothing (ADR-124 decision 4).
+    The record is never sent. One stored before the record existed has `removed = None`, and a
+    reconnect over it is answered with a full snapshot. Not a subclass of `DeltaReplaceEdgeSent`
+    (see `DeltaRemove`); `to_sent` is the conversion for the analyst who made the change."""
+
+    seq: int
+    op: Literal["replace_edge"] = "replace_edge"
+    old_edge_id: EdgeId
+    edge: Edge
+    removed: RemovedElement | None = None
+
+    def to_sent(self, reader: Principal) -> DeltaReplaceEdgeSent:
+        """The form the analyst who made the change is sent: the new link with its sources only
+        where `reader`'s case reads every dataset of it (ADR-130 Amendment 2). The stored form,
+        which the route publishes, holds the record in full."""
+        return DeltaReplaceEdgeSent(
+            seq=self.seq,
+            old_edge_id=self.old_edge_id,
+            edge=withhold_sources(self.edge, reader),
+        )
+
+
+class DeltaReproject(BaseModel):
+    """A resolution-threshold change (`PUT /v1/resolution/threshold`,
+    `03_CONDUIT_MIDDLEWARE.md` §3.5) re-collapses the working set at the
+    new τ; this is how the client learns what moved without re-fetching
+    the whole set.
+
+    It carries no figure of its own: the counts of how many entities merged, split or moved are
+    the acting analyst's, from their own view, and ride on their own response
+    (`ResolutionOutcome`) and not on a delta every reader receives (ADR-124 decision 1). Stored
+    deltas that still carry `merged`, `split` or `affected` parse: the model ignores extra fields.
+
+    `affected_cluster_ids` (Phase 6a Stage 2) is `ClusterDelta.affected_cluster_ids`
+    (`services/resolve/projection.py`) carried through unchanged — every node whose cluster
+    membership moved, mapped to its new cluster id, bounded by `affected` and therefore never a
+    full-working-set payload. It is what lets the Glass update cluster rendering in place instead
+    of re-syncing up to the 50k cap to learn a handful of new `cluster_id` values, and it is
+    already principal-safe by construction: it is derived from the same node population
+    `set_resolution_threshold` filters to the calling principal before clustering, not from the
+    investigation-shared set."""
+
+    seq: int
+    op: Literal["reproject"] = "reproject"
+    reason: str
+    affected_cluster_ids: dict[NodeId, ClusterId] = Field(default_factory=dict)
+
+
+class DeltaSnapshot(BaseModel):
+    """The reconnect path's full-state response — see the module
+    docstring. It carries no count of what the reader may not read (ADR-124 decision 1); a stored
+    snapshot that still carries `filtered_count` parses, since the model ignores extra fields."""
+
+    seq: int
+    op: Literal["snapshot"] = "snapshot"
+    nodes: list[Node] = Field(default_factory=list)
+    edges: list[Edge] = Field(default_factory=list)
+    #: ADR-124 decision 5, the standing sentence: `True` when the case's stored set holds any node
+    #: or link the reader may not view, `False` when it holds none. Set only in the full snapshot
+    #: that `sync` returns to a reader; `None` on every other delta (stored, replayed, pushed live,
+    #: restore's and a branch's included), and on a stored entry from before the field existed. A
+    #: bool and never a number: nothing here says how many or which.
+    withheld: bool | None = None
+
+
+WorkingSetDelta = Annotated[
+    DeltaAdd | DeltaRemove | DeltaReplaceEdge | DeltaReproject | DeltaSnapshot,
+    Field(discriminator="op"),
+]
+
+#: What is sent to a reader: on a socket, as a reconnect's catch-up, and in a route's response. It
+#: differs from `WorkingSetDelta`, which is what is stored and published, in two members, which
+#: never carry the record of what was removed (ADR-124 decision 4). The wire gate walks this union.
+WorkingSetDeltaSent = Annotated[
+    DeltaAdd
+    | DeltaRemoveSent
+    | DeltaReplaceEdgeSent
+    | DeltaReproject
+    | DeltaSnapshot
+    | DeltaViewOverCap,
+    Field(discriminator="op"),
+]
+
+_delta_adapter: TypeAdapter[Any] = TypeAdapter(WorkingSetDelta)
+
+
+def decode_delta(data: dict[str, Any]) -> WorkingSetDelta:
+    """Reconstructs the right delta subtype from its `op` discriminator —
+    used by `store.py` reading a delta back out of the capped Valkey
+    stream, and by `app.py`'s live WebSocket push, both of which only
+    ever have a delta as plain JSON (from the Valkey stream or a Pub/Sub
+    message) rather than a typed object."""
+    return _delta_adapter.validate_python(data)  # type: ignore[no-any-return]
+
+
+def lacks_record(delta: WorkingSetDelta) -> bool:
+    """Whether `delta` is a removal or a replacement stored before it carried the record of what it
+    removed. It cannot be projected for any reader (passing it on could send ids they may not read,
+    dropping its ids would leave their canvas unlike a snapshot's), so a store's `deltas_after`
+    answers `None` over one and the reader is sent a full snapshot (ADR-124 decision 4)."""
+    return isinstance(delta, DeltaRemove | DeltaReplaceEdge) and delta.removed is None
+
+
+class ExpansionOutcome(BaseModel):
+    """What `WorkingSetService.expand` returns on success — the delta the client should apply. It
+    carries no count of what was withheld (ADR-124 decision 1): a figure tied to a seed and a link
+    type can be made to point at the one hidden link it counts."""
+
+    delta: DeltaAdd
+    #: ADR-098: whether the links among the expansion's nodes and the view were brought too.
+    #: `not_asked` past the automatic limits; `view_full` when they would have passed the cap, so
+    #: none was added (never some of them) and the canvas says so.
+    links_among: Literal["added", "not_asked", "view_full"] = "not_asked"
+
+
+class LinksAmongRequest(BaseModel):
+    """`POST .../links-among` (ADR-098): the nodes whose links among each other to add — left out,
+    every node in the view — and, from a selection, how many degrees apart to look for routes
+    between them (Amendment 4); refused in words before the store is asked."""
+
+    node_ids: list[NodeId] | None = None
+    degree: int = Field(default=1, ge=1, le=LINKS_AMONG_MAX_DEGREE)
+
+    @model_validator(mode="after")
+    def _routes_need_a_small_selection(self) -> LinksAmongRequest:
+        if self.degree == 1:
+            return self
+        chosen = len(set(self.node_ids or []))
+        if self.node_ids is None or chosen < 2:
+            raise ValueError("routes between nodes need at least two of them selected")
+        if chosen > LINKS_AMONG_ROUTE_NODES:
+            raise ValueError(
+                f"routes are looked for among at most {LINKS_AMONG_ROUTE_NODES} selected nodes; "
+                f"{chosen} are selected"
+            )
+        return self
+
+
+class LinksAmongOutcome(BaseModel):
+    """`POST .../links-among` (ADR-098): the delta that draws the new links, and how many — with,
+    past one degree (Amendment 4), the nodes the routes brought, the pairs no route joins within
+    the degree, and the pairs with more routes at their degree than were drawn (said, rule 2)."""
+
+    delta: DeltaAdd
+    added: int
+    added_nodes: int = 0
+    degree: int = 1
+    unconnected_pairs: int = 0
+    more_routes_pairs: int = 0
+
+
+class NodeNotInWorkingSetError(Exception):
+    """Raised by `manual_link`/`manual_split` when either node id is not currently part of this
+    investigation's working set. An analyst can only assert a resolution relationship between
+    nodes they can already see in their own session — the same boundary `03_CONDUIT_MIDDLEWARE.md`
+    §6 draws for every other read/write here, applied to a pair of ids instead of one."""
+
+
+class SameNodeAssertionError(Exception):
+    """Raised by `manual_link`/`manual_split` when `node_a == node_b` — asserting a node is (or
+    is not) the same as itself is meaningless and would otherwise silently no-op through
+    `compute_clusters`' own union-find rather than surfacing as the caller mistake it is."""
+
+
+class ClusterNotFoundError(Exception):
+    """Raised by `explain` when no node in the working set currently carries the requested
+    `cluster_id` — most often a stale id from before the working set's last reproject."""
+
+
+class PairwiseExplanation(BaseModel):
+    """One direct `SAME_AS`/`NOT_SAME_AS` edge between two current members of an explained
+    cluster — `03_CONDUIT_MIDDLEWARE.md` §3.5: "Return the per-comparison match weights, not just
+    the total." `score`/`model_version`/`comparison_vector` are `None` for a manually-asserted
+    edge (`manually_asserted=True`) — a human decision, not a model score, has none of those to
+    report. `meets_threshold` is evaluated against the session's *current* τ, not baked in at
+    write time, since the same edge can cross a threshold that later moves without the edge
+    itself changing."""
+
+    node_a: NodeId
+    node_b: NodeId
+    edge_type: Literal["SAME_AS", "NOT_SAME_AS"]
+    score: float | None
+    model_version: str | None
+    comparison_vector: dict[str, Any] | None
+    manually_asserted: bool
+    meets_threshold: bool
+
+
+class ClusterExplanation(BaseModel):
+    """`GET /resolution/explain/{cluster}`'s response — every direct resolution edge between two
+    of the cluster's current members, so an analyst can see *why* a transitively-clustered pair
+    that does not look alike ended up together (through a third node), not only the pairs that
+    individually cleared τ."""
+
+    cluster_id: ClusterId
+    member_node_ids: list[NodeId]
+    pairs: list[PairwiseExplanation]
+
+
+class CardinalityPreview(BaseModel):
+    """`POST /expand/preview` (`03_CONDUIT_MIDDLEWARE.md` §3.2): cardinality
+    only, no mutation. `would_breach` names which cap, if any, an actual
+    `expand` with this request would hit — the same `LimitExceeded` shape,
+    computed without writing anything. Both counts are over the reader's own projected view
+    plus what the request adds (ADR-124 decision 2), so they are the same with and without a
+    stored item the reader may not read."""
+
+    candidate_node_count: int
+    candidate_edge_count: int
+    would_breach: LimitExceeded | None = None
+
+
+class ResolutionOutcome(BaseModel):
+    """What the three resolution routes answer (`PUT .../resolution/threshold` and the manual
+    same-as and split, ADR-124 decision 1): the delta every reader receives, and the figures the
+    resolution changed, as the acting analyst's own view counts them. The figures are the actor's
+    own response and withhold nothing from them; they are not on the delta, which other readers
+    receive."""
+
+    delta: DeltaReproject
+    merged: int = 0
+    split: int = 0
+    affected: int = 0
+
+
+__all__ = [
+    "MAX_EDGES",
+    "MAX_NODES",
+    "BranchFilter",
+    "CardinalityPreview",
+    "ClusterExplanation",
+    "ClusterNotFoundError",
+    "DeltaAdd",
+    "DeltaRemove",
+    "DeltaRemoveSent",
+    "DeltaReplaceEdge",
+    "DeltaReplaceEdgeSent",
+    "DeltaReproject",
+    "DeltaSnapshot",
+    "DeltaViewOverCap",
+    "EdgeId",
+    "decode_delta",
+    "lacks_record",
+    "ExpansionOutcome",
+    "LimitExceeded",
+    "LimitExceededError",
+    "LimitOption",
+    "NodeId",
+    "NodeNotInWorkingSetError",
+    "PairwiseExplanation",
+    "RemovedElement",
+    "RemovedRecord",
+    "ResolutionOutcome",
+    "SameNodeAssertionError",
+    "WorkingSetDelta",
+    "WorkingSetDeltaSent",
+]
